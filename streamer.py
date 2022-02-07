@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from socket import INADDR_ANY
 from struct import pack, unpack
 import time
+import hashlib
 
 
 class Streamer:
@@ -31,7 +32,9 @@ class Streamer:
         self.closed = False
 
         self.MAX_TRANSMISSION_UNIT = 1472
+        self.HASH_LENGTH = 16
         self.SEQ_NUM_LENGTH = 4
+        self.HEADER_LENGTH = 22
         self.ACK_TIMEOUT = 0.25
 
         executor = ThreadPoolExecutor(max_workers=1)
@@ -84,8 +87,10 @@ class Streamer:
                 if len(data) == 0:
                     self.closed = True
                     break
-                fin, ack, seq_num, data = self._split_packet_data(data)
-
+                hash, fin, ack, seq_num, data = self._split_packet_data(data)
+                if self._hash_data(fin + ack + seq_num + data) != hash:
+                    continue
+                fin, ack, seq_num = unpack("B", fin)[0], unpack("B", ack)[0], unpack("i", seq_num)[0]
                 if ack == 1:
                     self.ack = True
                 else:
@@ -130,32 +135,40 @@ class Streamer:
         self.socket.stoprecv()
 
     def _split_packet_data(self, data):
-        fin, data = data[0], data[1:]
-        ack, data = data[0], data[1:]
-        seq_num, data = unpack("i", data[:self.SEQ_NUM_LENGTH])[0], data[self.SEQ_NUM_LENGTH:]
-        return fin, ack, seq_num, data
+        hash, data = data[:self.HASH_LENGTH], data[self.HASH_LENGTH:]
+        fin, data = data[:1], data[1:]
+        ack, data = data[:1], data[1:]
+        seq_num, data = data[:self.SEQ_NUM_LENGTH], data[self.SEQ_NUM_LENGTH:]
+        return hash, fin, ack, seq_num, data
 
     def _split_data(self, data_bytes) -> None:
         packets = []
         curr_byte = 0
 
         while curr_byte < len(data_bytes):
-            header = self._create_header()
-            packet_end = min(len(data_bytes), curr_byte + self.MAX_TRANSMISSION_UNIT - len(header))
-            packet_data = header + data_bytes[curr_byte:packet_end]
-            packets.append(packet_data)
+            packet_end = min(len(data_bytes), curr_byte + self.MAX_TRANSMISSION_UNIT - self.HEADER_LENGTH)
+            packet_data = data_bytes[curr_byte:packet_end]
+            header = self._create_header(data=packet_data)
+            packets.append(header + packet_data)
             self.seq_num += packet_end - curr_byte
             curr_byte = packet_end
 
         return packets
 
-    def _create_header(self, ack=False, fin=False):
+    def _create_header(self, ack=False, fin=False, data=bytes()):
         fin_byte = pack("B", 1) if fin else pack("B", 0)
         ack_byte = pack("B", 1) if ack else pack("B", 0)
-        return fin_byte + ack_byte + pack("i", self.seq_num)
+        seq_num_bytes = pack("i", self.seq_num)
+        hash = self._hash_data(fin_byte + ack_byte + seq_num_bytes + data)
+        return hash + fin_byte + ack_byte + seq_num_bytes
 
     def _min_seq_num_from_buffer(self):
         if len(self.receive_buffer) == 0:
             return float("inf")
         else:
             return min(self.receive_buffer.keys())
+
+    def _hash_data(self, data: bytes):
+        m = hashlib.md5()
+        m.update(data)
+        return m.digest()
