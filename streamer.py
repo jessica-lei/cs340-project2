@@ -8,6 +8,21 @@ import time
 import hashlib
 
 
+# Continue to send packets in send() without waiting for an ACK & place them in a
+# "buffer" that keeps track of un-ACKed packets
+
+# Every time a listener receives an ACK for a packet, remove that packet from the buffer above
+
+# Run a timer in the background that tracks the timeout of the oldest un-ACKed segment in the buffer
+# If the ACK received is the ACK for the oldest un-ACKed segment, re-start the timer for the
+# next oldest segment in the buffer (if the buffer is not empty)
+
+# If timer runs out without receiving the ACK, individually re-send the packet in question
+# and re-start the timer for that same segment
+
+# In Streamer.close(), ensure the send buffer and receive buffer are empty before closing
+# (ensuring there are no un-ACKed in-flight packets)
+
 class Streamer:
     def __init__(self, dst_ip, dst_port,
                  src_ip=INADDR_ANY, src_port=0):
@@ -26,39 +41,35 @@ class Streamer:
         self.expected_seq_num = 0
         # Receive buffer mapping incoming sequence numbers to packet data
         self.receive_buffer = {}
+        # Tracks un-ACKed packets: Maps expected ACK numbers to the corresponding packet
+        self.unacked_packets = {}
+        self.timer_start = float("inf")  # time when oldest packet in unacked_packets is sent
 
-        self.ack = False
         self.fin = False
         self.closed = False
 
         self.MAX_TRANSMISSION_UNIT = 1472
         self.HASH_LENGTH = 16
         self.SEQ_NUM_LENGTH = 4
+        self.ACK_NUM_LENGTH = 4
         self.HEADER_LENGTH = 22
         self.ACK_TIMEOUT = 0.25
 
-        executor = ThreadPoolExecutor(max_workers=1)
+        executor = ThreadPoolExecutor(max_workers=2)
         executor.submit(self.listener)
+        executor.submit(self.timer)
 
     def send(self, data_bytes: bytes) -> None:
         """Note that data_bytes can be larger than one packet."""
         packets = self._split_data(data_bytes)
-        idx = 0
 
-        while idx < len(packets):
-            packet = packets[idx]
+        for packet in packets:
             self.socket.sendto(packet, (self.dst_ip, self.dst_port))
-            ack_timed_out = False
-            start_time = time.time()
-            while not self.ack:  # wait while ACK for the current packet has not been received
-                if time.time() - start_time > self.ACK_TIMEOUT:
-                    ack_timed_out = True
-                    break
-                time.sleep(0.01)
-            if ack_timed_out:
-                continue
-            idx += 1
-            self.ack = False
+            packet_sent_at = time.time()
+            if packet_sent_at < self.timer_start:  # when self.unacked_packets is empty
+                self.timer_start = packet_sent_at
+            _, _, _, seq_num, _, data = self._split_packet_data(packet)
+            self.unacked_packets[unpack("i", seq_num)[0] + len(data)] = packet  # keep track of unacked packets
 
     def recv(self) -> bytes:
         """Blocks (waits) if no data is ready to be read from the connection."""
@@ -87,41 +98,67 @@ class Streamer:
                 if len(data) == 0:
                     self.closed = True
                     break
-                hash, fin, ack, seq_num, data = self._split_packet_data(data)
-                if self._hash_data(fin + ack + seq_num + data) != hash:
+                hash, fin, ack, seq_num, ack_num, data = self._split_packet_data(data)
+                print("IN LISTENER:", fin, ack, seq_num, ack_num, data)
+
+                if self._hash_data(fin + ack + seq_num + ack_num + data) != hash:
                     continue
-                fin, ack, seq_num = unpack("B", fin)[0], unpack("B", ack)[0], unpack("i", seq_num)[0]
+                fin, ack = unpack("B", fin)[0], unpack("B", ack)[0]
+                seq_num, ack_num = unpack("i", seq_num)[0], unpack("i", ack_num)[0]
+
                 if ack == 1:
-                    self.ack = True
+                    if ack_num in self.unacked_packets:  # not duplicate ACK
+                        if ack_num == min(self.unacked_packets.keys()):  # oldest packet removed
+                            if len(self.unacked_packets) == 1:  # no more unACKed packets
+                                self.timer_start = float("inf")
+                            else:  # more unACKed packets
+                                self.timer_start = time.time()
+                        del self.unacked_packets[ack_num]
+
                 else:
                     if fin == 1:
                         self.fin = True
-                    elif seq_num >= self.expected_seq_num:
-                        # Place packet data in receive buffer (if not duplicate)
+                        self.socket.sendto(self._create_header(ack_num=self.expected_seq_num, ack=True), addr)
+                    elif seq_num > self.expected_seq_num:
+                        print("out of order")
+
+                        # If out of order, re-send expected sequence number (duplicate ACK)
                         self.receive_buffer[seq_num] = data
-                    self.socket.sendto(self._create_header(ack=True), addr)
+                        self.socket.sendto(self._create_header(ack_num=self.expected_seq_num, ack=True), addr)
+                    elif seq_num == self.expected_seq_num:
+                        print("correct order")
+                        # If in correct order, send next expected sequence number
+                        self.receive_buffer[seq_num] = data
+                        self.socket.sendto(self._create_header(ack_num=seq_num + len(data), ack=True), addr)
 
             except Exception as e:
                 print("listener died!")
                 print(e)
 
+    def timer(self):
+        while True:
+            if time.time() - self.timer_start > self.ACK_TIMEOUT:
+                oldest_unacked_packet = self.unacked_packets[min(self.unacked_packets.keys())]
+                self.socket.sendto(oldest_unacked_packet, (self.dst_ip, self.dst_port))
+                self.timer_start = time.time()
+            time.sleep(0.01)
+
     def close(self) -> None:
         """Cleans up. It should block (wait) until the Streamer is done with all
            the necessary ACKs and retransmissions"""
-        while True:
-            # Send a FIN packet.
-            self.socket.sendto(self._create_header(fin=True), (self.dst_ip, self.dst_port))
+        # Ensure no remaining packets are in-flight
+        while len(self.receive_buffer) > 0 or len(self.unacked_packets) > 0:
+            time.sleep(0.01)
 
-            # Wait for an ACK of the FIN packet. Go back to previous step if a timer expires.
-            ack_timed_out = False
-            start_time = time.time()
-            while not self.ack:
-                if time.time() - start_time > self.ACK_TIMEOUT:
-                    ack_timed_out = True
-                    break
-                time.sleep(0.01)
-            if not ack_timed_out:
-                break
+        # Send a FIN packet.
+        fin_packet = self._create_header(ack_num=self.expected_seq_num, fin=True)
+        self.socket.sendto(fin_packet, (self.dst_ip, self.dst_port))
+        self.timer_start = time.time()
+        self.unacked_packets[self.seq_num] = fin_packet
+
+        # Wait to receive ACK for FIN packet
+        while len(self.unacked_packets) > 0:
+            time.sleep(0.01)
 
         # Wait until the listener records that a FIN packet was received from the other side.
         while not self.fin:
@@ -139,7 +176,8 @@ class Streamer:
         fin, data = data[:1], data[1:]
         ack, data = data[:1], data[1:]
         seq_num, data = data[:self.SEQ_NUM_LENGTH], data[self.SEQ_NUM_LENGTH:]
-        return hash, fin, ack, seq_num, data
+        ack_num, data = data[:self.ACK_NUM_LENGTH], data[self.ACK_NUM_LENGTH:]
+        return hash, fin, ack, seq_num, ack_num, data
 
     def _split_data(self, data_bytes) -> None:
         packets = []
@@ -148,19 +186,21 @@ class Streamer:
         while curr_byte < len(data_bytes):
             packet_end = min(len(data_bytes), curr_byte + self.MAX_TRANSMISSION_UNIT - self.HEADER_LENGTH)
             packet_data = data_bytes[curr_byte:packet_end]
-            header = self._create_header(data=packet_data)
+            header = self._create_header(ack_num=self.expected_seq_num, data=packet_data)
             packets.append(header + packet_data)
             self.seq_num += packet_end - curr_byte
             curr_byte = packet_end
 
         return packets
 
-    def _create_header(self, ack=False, fin=False, data=bytes()):
+    def _create_header(self, ack_num=0, ack=False, fin=False, data=bytes()):
         fin_byte = pack("B", 1) if fin else pack("B", 0)
         ack_byte = pack("B", 1) if ack else pack("B", 0)
         seq_num_bytes = pack("i", self.seq_num)
-        hash = self._hash_data(fin_byte + ack_byte + seq_num_bytes + data)
-        return hash + fin_byte + ack_byte + seq_num_bytes
+        ack_num_bytes = pack("i", ack_num)
+        print("IN CREATE HEADER:", fin_byte, ack_byte, seq_num_bytes, ack_num_bytes, data)
+        hash = self._hash_data(fin_byte + ack_byte + seq_num_bytes + ack_num_bytes + data)
+        return hash + fin_byte + ack_byte + seq_num_bytes + ack_num_bytes
 
     def _min_seq_num_from_buffer(self):
         if len(self.receive_buffer) == 0:
